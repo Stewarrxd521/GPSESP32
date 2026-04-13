@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GPS Tracker</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <strong>GPS Tracker</strong>
+      <span id="status" class="pill">Desconectado</span>
+    </div>
+    <button id="logoutBtn" class="secondary">Salir</button>
+  </header>
+
+  <main class="layout">
+    <section class="panel">
+      <h2>Última posición</h2>
+      <div class="stats">
+        <div><span>Vehículo</span><strong id="device">-</strong></div>
+        <div><span>Lat</span><strong id="lat">-</strong></div>
+        <div><span>Lng</span><strong id="lng">-</strong></div>
+        <div><span>Velocidad</span><strong id="speed">-</strong></div>
+        <div><span>Rumbo</span><strong id="heading">-</strong></div>
+        <div><span>Hora</span><strong id="time">-</strong></div>
+      </div>
+      <p class="muted">La ruta se dibuja automáticamente con cada punto recibido por MQTT.</p>
+    </section>
+
+    <section id="map"></section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const token = localStorage.getItem('token');
+    if (!token) window.location.href = '/';
+
+    const logoutBtn = document.getElementById('logoutBtn');
+    logoutBtn.onclick = () => { localStorage.removeItem('token'); window.location.href = '/'; };
+
+    const statusEl = document.getElementById('status');
+    const fields = {
+      device: document.getElementById('device'),
+      lat: document.getElementById('lat'),
+      lng: document.getElementById('lng'),
+      speed: document.getElementById('speed'),
+      heading: document.getElementById('heading'),
+      time: document.getElementById('time'),
+    };
+
+    const map = L.map('map').setView([4.711, -74.0721], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(map);
+
+    let marker = null;
+    let route = L.polyline([], { weight: 5 }).addTo(map);
+
+    function setStats(d) {
+      fields.device.textContent = d.device_id ?? '-';
+      fields.lat.textContent = d.lat?.toFixed ? d.lat.toFixed(6) : d.lat ?? '-';
+      fields.lng.textContent = d.lng?.toFixed ? d.lng.toFixed(6) : d.lng ?? '-';
+      fields.speed.textContent = d.speed ?? '-';
+      fields.heading.textContent = d.heading ?? '-';
+      fields.time.textContent = d.ts || d.created_at || '-';
+    }
+
+    function updatePoint(d) {
+      const latlng = [Number(d.lat), Number(d.lng)];
+      setStats(d);
+      statusEl.textContent = 'En línea';
+
+      if (!marker) {
+        marker = L.marker(latlng).addTo(map);
+        map.setView(latlng, 16);
+      } else {
+        marker.setLatLng(latlng);
+      }
+
+      route.addLatLng(latlng);
+      map.fitBounds(route.getBounds(), { padding: [30, 30] });
+    }
+
+    async function loadLatest() {
+      const res = await fetch('/api/latest', { headers: { 'Authorization': `Bearer ${token}` } });
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.data) updatePoint(data.data);
+    }
+
+    async function loadHistory(deviceId) {
+      const res = await fetch(`/api/history/${encodeURIComponent(deviceId)}?limit=1000`, {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (!res.ok) return;
+      const data = await res.json();
+      route = L.polyline([], { weight: 5 }).addTo(map);
+      data.points.forEach(p => route.addLatLng([p.lat, p.lng]));
+      if (data.points.length) {
+        const last = data.points[data.points.length - 1];
+        if (!marker) marker = L.marker([last.lat, last.lng]).addTo(map);
+        marker.setLatLng([last.lat, last.lng]);
+        map.fitBounds(route.getBounds(), { padding: [30, 30] });
+        setStats({ ...last, device_id: deviceId });
+      }
+    }
+
+    loadLatest().then(() => {
+      const storedDevice = fields.device.textContent;
+      if (storedDevice && storedDevice !== '-') {
+        loadHistory(storedDevice);
+      }
+    });
+
+    const ws = new WebSocket(`wss://${location.host}/ws?token=${encodeURIComponent(token)}`);
+    ws.onopen = () => { statusEl.textContent = 'Conectado'; };
+    ws.onclose = () => { statusEl.textContent = 'Desconectado'; };
+    ws.onerror = () => { statusEl.textContent = 'Error WS'; };
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'gps') updatePoint(msg);
+    };
+
+    setInterval(() => {
+      if (ws.readyState === 1) ws.send('ping');
+    }, 25000);
+  </script>
+</body>
+</html>

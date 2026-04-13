@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -246,14 +247,29 @@ def start_mqtt(loop: asyncio.AbstractEventLoop):
             client.tls_insecure_set(True)
 
     logger.info("Conectando MQTT a %s:%s", MQTT_HOST, MQTT_PORT)
-    client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
-    client.loop_start()
+    try:
+        client.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+        client.loop_start()
+    except Exception as exc:
+        logger.exception("No se pudo iniciar MQTT: %s", exc)
+
+    return client
 
 
-@app.on_event("startup")
-async def startup_event():
+@contextlib.asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    del app_instance
     ensure_admin_user()
-    start_mqtt(asyncio.get_running_loop())
+    mqtt_client = start_mqtt(asyncio.get_running_loop())
+    try:
+        yield
+    finally:
+        if mqtt_client is not None:
+            mqtt_client.loop_stop()
+            mqtt_client.disconnect()
+
+
+app.router.lifespan_context = lifespan
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -394,3 +410,11 @@ async def websocket_endpoint(websocket: WebSocket):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("main:app", host=host, port=port)

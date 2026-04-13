@@ -6,10 +6,10 @@ body { margin:0; font-family: Inter, system-ui, Arial, sans-serif; background: l
 .card { width:min(420px, 100%); padding:28px; }
 h1, h2 { margin:0 0 14px; }
 .muted { color:var(--muted); }
-form { display:grid; gap:10px; margin-top:18px; }
+form, .controls { display:grid; gap:10px; margin-top:18px; }
 label { font-size:.92rem; color:var(--muted); }
-input, button { border-radius:14px; padding:14px 16px; border:1px solid var(--line); font: inherit; }
-input { background:#0c1329; color:var(--text); }
+input, button, select { border-radius:14px; padding:12px 14px; border:1px solid var(--line); font: inherit; }
+input, select { background:#0c1329; color:var(--text); }
 button { background: var(--accent); border:none; color:#09111f; font-weight:700; cursor:pointer; }
 button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
 .msg { margin-top:14px; min-height: 1.2em; color:#ffd27d; }
@@ -19,7 +19,7 @@ button.secondary { background: transparent; color: var(--text); border: 1px soli
 
 .layout { display:grid; grid-template-columns: 360px 1fr; gap:16px; padding:16px; height: calc(100vh - 68px); }
 .panel { padding:18px; overflow:auto; }
-.stats { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.stats { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:18px; }
 .stats div { background:#0c1329; border:1px solid var(--line); border-radius:14px; padding:12px; }
 .stats span { display:block; color:var(--muted); font-size:.82rem; margin-bottom:6px; }
 .stats strong { font-size:1.02rem; }

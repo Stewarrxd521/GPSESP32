@@ -1,9 +1,13 @@
 import asyncio
 import contextlib
+import hashlib
+import hmac
 import json
 import logging
 import os
 import ssl
+import secrets
+from base64 import b64decode, b64encode
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Optional, Set
 
@@ -14,7 +18,6 @@ from fastapi.security import OAuth2PasswordBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jose import JWTError, jwt
-from passlib.context import CryptContext
 from sqlalchemy import Column, DateTime, Float, Integer, String, Text, create_engine, desc
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -38,7 +41,6 @@ MQTT_TOPIC = os.getenv("MQTT_TOPIC", "vehicles/+/gps")
 MQTT_TLS = os.getenv("MQTT_TLS", "true").lower() in {"1", "true", "yes"}
 MQTT_TLS_INSECURE = os.getenv("MQTT_TLS_INSECURE", "false").lower() in {"1", "true", "yes"}
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/login")
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
@@ -77,12 +79,29 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
 
 
-def verify_password(plain_password: str, password_hash: str) -> bool:
-    return pwd_context.verify(plain_password, password_hash)
+PASSWORD_SCHEME = "pbkdf2_sha256"
+PASSWORD_ITERATIONS = 600_000
 
 
 def get_password_hash(password: str) -> str:
-    return pwd_context.hash(password)
+    salt = secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, PASSWORD_ITERATIONS, dklen=32)
+    return f"{PASSWORD_SCHEME}${PASSWORD_ITERATIONS}${b64encode(salt).decode()}${b64encode(digest).decode()}"
+
+
+def verify_password(plain_password: str, password_hash: str) -> bool:
+    try:
+        scheme, rounds_str, salt_b64, digest_b64 = password_hash.split("$", 3)
+        if scheme != PASSWORD_SCHEME:
+            return False
+        rounds = int(rounds_str)
+        salt = b64decode(salt_b64)
+        expected = b64decode(digest_b64)
+    except (ValueError, TypeError):
+        return False
+
+    digest = hashlib.pbkdf2_hmac("sha256", plain_password.encode("utf-8"), salt, rounds, dklen=len(expected))
+    return hmac.compare_digest(digest, expected)
 
 
 def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):

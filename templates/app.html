@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>GPS Tracker</title>
+  <link rel="stylesheet" href="/static/style.css">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <strong>GPS Tracker</strong>
+      <span id="status" class="pill">Desconectado</span>
+    </div>
+    <button id="logoutBtn" class="secondary">Salir</button>
+  </header>
+
+  <main class="layout">
+    <section class="panel">
+      <h2>Seguimiento de vehículo</h2>
+      <div class="controls">
+        <label>Vehículo</label>
+        <select id="deviceSelect"></select>
+        <label>Día (UTC)</label>
+        <input id="dayInput" type="date">
+        <button id="loadDayBtn" type="button">Cargar ruta del día</button>
+      </div>
+      <div class="stats">
+        <div><span>Vehículo</span><strong id="device">-</strong></div>
+        <div><span>Lat</span><strong id="lat">-</strong></div>
+        <div><span>Lng</span><strong id="lng">-</strong></div>
+        <div><span>Velocidad</span><strong id="speed">-</strong></div>
+        <div><span>Rumbo</span><strong id="heading">-</strong></div>
+        <div><span>Hora</span><strong id="time">-</strong></div>
+      </div>
+      <p class="muted">Muestra última posición, movimiento en vivo y ruta histórica por día.</p>
+    </section>
+
+    <section id="map"></section>
+  </main>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const token = localStorage.getItem('token');
+    if (!token) window.location.href = '/';
+
+    const statusEl = document.getElementById('status');
+    const deviceSelect = document.getElementById('deviceSelect');
+    const dayInput = document.getElementById('dayInput');
+    dayInput.value = new Date().toISOString().slice(0, 10);
+
+    const fields = {
+      device: document.getElementById('device'),
+      lat: document.getElementById('lat'),
+      lng: document.getElementById('lng'),
+      speed: document.getElementById('speed'),
+      heading: document.getElementById('heading'),
+      time: document.getElementById('time'),
+    };
+
+    document.getElementById('logoutBtn').onclick = () => {
+      localStorage.removeItem('token');
+      window.location.href = '/';
+    };
+
+    const map = L.map('map').setView([4.711, -74.0721], 13);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19, attribution: '&copy; OpenStreetMap' }).addTo(map);
+
+    let marker = null;
+    let route = L.polyline([], { weight: 5 }).addTo(map);
+
+    function setStats(d) {
+      fields.device.textContent = d.device_id ?? '-';
+      fields.lat.textContent = Number.isFinite(Number(d.lat)) ? Number(d.lat).toFixed(6) : '-';
+      fields.lng.textContent = Number.isFinite(Number(d.lng)) ? Number(d.lng).toFixed(6) : '-';
+      fields.speed.textContent = d.speed ?? '-';
+      fields.heading.textContent = d.heading ?? '-';
+      fields.time.textContent = d.ts || d.created_at || '-';
+    }
+
+    function paintPoint(d, fit = true) {
+      const latlng = [Number(d.lat), Number(d.lng)];
+      if (!Number.isFinite(latlng[0]) || !Number.isFinite(latlng[1])) return;
+      setStats(d);
+      statusEl.textContent = 'En línea';
+
+      if (!marker) {
+        marker = L.marker(latlng).addTo(map);
+      } else {
+        marker.setLatLng(latlng);
+      }
+
+      route.addLatLng(latlng);
+      if (fit && route.getLatLngs().length > 1) map.fitBounds(route.getBounds(), { padding: [30, 30] });
+      else map.setView(latlng, 16);
+    }
+
+    function clearRoute() {
+      map.removeLayer(route);
+      route = L.polyline([], { weight: 5 }).addTo(map);
+    }
+
+    async function api(path) {
+      const res = await fetch(path, { headers: { Authorization: `Bearer ${token}` } });
+      if (res.status === 401) {
+        localStorage.removeItem('token');
+        window.location.href = '/';
+        return null;
+      }
+      return res.ok ? res.json() : null;
+    }
+
+    async function loadDevices() {
+      const data = await api('/api/devices');
+      if (!data?.devices?.length) return;
+      deviceSelect.innerHTML = data.devices.map(d => `<option value="${d}">${d}</option>`).join('');
+    }
+
+    async function loadLatest() {
+      const data = await api('/api/latest');
+      if (data?.data) {
+        if ([...deviceSelect.options].find(o => o.value === data.data.device_id) == null) {
+          const option = document.createElement('option');
+          option.value = data.data.device_id;
+          option.textContent = data.data.device_id;
+          deviceSelect.appendChild(option);
+        }
+        deviceSelect.value = data.data.device_id;
+        paintPoint(data.data, false);
+      }
+    }
+
+    async function loadDayRoute() {
+      const deviceId = deviceSelect.value;
+      if (!deviceId) return;
+      const day = dayInput.value;
+      const data = await api(`/api/history/${encodeURIComponent(deviceId)}/day?day=${encodeURIComponent(day)}`);
+      if (!data) return;
+      clearRoute();
+      data.points.forEach((p, idx) => paintPoint({ ...p, device_id: deviceId }, idx === data.points.length - 1));
+    }
+
+    document.getElementById('loadDayBtn').onclick = loadDayRoute;
+
+    (async () => {
+      await loadDevices();
+      await loadLatest();
+      await loadDayRoute();
+    })();
+
+    const ws = new WebSocket(`wss://${location.host}/ws?token=${encodeURIComponent(token)}`);
+    ws.onopen = () => { statusEl.textContent = 'Conectado'; };
+    ws.onclose = () => { statusEl.textContent = 'Desconectado'; };
+    ws.onerror = () => { statusEl.textContent = 'Error WS'; };
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type !== 'gps') return;
+      if (!deviceSelect.value || deviceSelect.value === msg.device_id) paintPoint(msg, false);
+      if (![...deviceSelect.options].find(o => o.value === msg.device_id)) {
+        const option = document.createElement('option');
+        option.value = msg.device_id;
+        option.textContent = msg.device_id;
+        deviceSelect.appendChild(option);
+      }
+    };
+
+    setInterval(() => {
+      if (ws.readyState === 1) ws.send('ping');
+    }, 25000);
+  </script>
+</body>
+</html>

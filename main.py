@@ -5,11 +5,13 @@ import hmac
 import json
 import logging
 import os
+import socket
 import ssl
 import secrets
+import time as pytime
 from base64 import b64decode, b64encode
 from datetime import date, datetime, time, timedelta, timezone
-from urllib.parse import quote_plus
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
 from typing import Optional, Set
 
 import paho.mqtt.client as mqtt
@@ -52,7 +54,33 @@ def build_database_url() -> str:
     return f"postgresql+psycopg://{db_user}{password_part}@{db_host}:{db_port}/{db_name}?sslmode={db_sslmode}"
 
 
+def add_ipv4_hostaddr(database_url: str) -> str:
+    parsed = urlparse(database_url)
+    hostname = parsed.hostname
+    if not hostname:
+        return database_url
+
+    query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if "hostaddr" in query_params:
+        return database_url
+
+    try:
+        ipv4_info = socket.getaddrinfo(hostname, parsed.port or 5432, socket.AF_INET, socket.SOCK_STREAM)
+        if not ipv4_info:
+            return database_url
+        ipv4 = ipv4_info[0][4][0]
+    except socket.gaierror:
+        return database_url
+
+    query_params["hostaddr"] = ipv4
+    new_query = urlencode(query_params)
+    return urlunparse(parsed._replace(query=new_query))
+
+
 DATABASE_URL = build_database_url()
+DB_FORCE_IPV4 = os.getenv("DB_FORCE_IPV4", "true").lower() in {"1", "true", "yes"}
+if DB_FORCE_IPV4 and DATABASE_URL.startswith("postgresql"):
+    DATABASE_URL = add_ipv4_hostaddr(DATABASE_URL)
 if DATABASE_URL.startswith("sqlite"):
     logger.warning("DATABASE_URL no configurada para PostgreSQL; usando SQLite local (no recomendado para producción)")
 
@@ -105,8 +133,6 @@ class VehicleClient(Base):
     last_seen_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
     last_topic = Column(String(255), nullable=True)
 
-
-Base.metadata.create_all(bind=engine)
 
 app = FastAPI(title="GPS Tracker MQTT", version="2.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -214,6 +240,23 @@ class ConnectionManager:
 
 manager = ConnectionManager()
 mqtt_client_instance: Optional[mqtt.Client] = None
+
+
+def init_database_schema(retries: int = 5, delay_seconds: float = 2.0) -> bool:
+    for attempt in range(1, retries + 1):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return True
+        except Exception as exc:
+            logger.error(
+                "No se pudo inicializar la base de datos (intento %s/%s): %s",
+                attempt,
+                retries,
+                exc,
+            )
+            if attempt < retries:
+                pytime.sleep(delay_seconds)
+    return False
 
 
 def parse_vehicle_payload(topic: str, payload: bytes) -> dict:
@@ -422,7 +465,14 @@ def publish_vehicle_command(device_id: str, action: str):
 async def lifespan(app_instance: FastAPI):
     del app_instance
     global mqtt_client_instance
-    ensure_admin_user()
+    db_ready = init_database_schema(
+        retries=int(os.getenv("DB_INIT_RETRIES", "8")),
+        delay_seconds=float(os.getenv("DB_INIT_RETRY_SECONDS", "2")),
+    )
+    if db_ready:
+        ensure_admin_user()
+    else:
+        logger.error("La app inicia sin DB disponible; endpoints con DB pueden fallar hasta que se recupere conexión.")
     mqtt_client_instance = start_mqtt(asyncio.get_running_loop())
     try:
         yield

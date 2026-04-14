@@ -9,6 +9,7 @@ import ssl
 import secrets
 from base64 import b64decode, b64encode
 from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import quote_plus
 from typing import Optional, Set
 
 import paho.mqtt.client as mqtt
@@ -32,7 +33,28 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./gps.db")
+def build_database_url() -> str:
+    explicit_url = os.getenv("DATABASE_URL")
+    if explicit_url:
+        return explicit_url
+
+    db_host = os.getenv("DB_HOST", "").strip()
+    if not db_host:
+        return "sqlite:///./gps.db"
+
+    db_port = os.getenv("DB_PORT", "5432").strip()
+    db_name = os.getenv("DB_NAME", "postgres").strip()
+    db_user = os.getenv("DB_USER", "postgres").strip()
+    db_password = os.getenv("DB_PASSWORD", "").strip()
+    db_sslmode = os.getenv("DB_SSLMODE", "require").strip()
+
+    password_part = f":{quote_plus(db_password)}" if db_password else ""
+    return f"postgresql+psycopg://{db_user}{password_part}@{db_host}:{db_port}/{db_name}?sslmode={db_sslmode}"
+
+
+DATABASE_URL = build_database_url()
+if DATABASE_URL.startswith("sqlite"):
+    logger.warning("DATABASE_URL no configurada para PostgreSQL; usando SQLite local (no recomendado para producción)")
 
 MQTT_HOST = os.getenv("MQTT_HOST", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
@@ -72,6 +94,16 @@ class VehiclePosition(Base):
     accuracy = Column(Float, nullable=True)
     raw = Column(Text, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+
+
+class VehicleClient(Base):
+    __tablename__ = "vehicle_clients"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(String(120), unique=True, index=True, nullable=False)
+    first_seen_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    last_topic = Column(String(255), nullable=True)
 
 
 Base.metadata.create_all(bind=engine)
@@ -200,6 +232,7 @@ def parse_vehicle_payload(topic: str, payload: bytes) -> dict:
 
     return {
         "device_id": str(device_id),
+        "topic": topic,
         "lat": lat,
         "lng": lng,
         "speed": speed,
@@ -214,6 +247,7 @@ def parse_vehicle_payload(topic: str, payload: bytes) -> dict:
 def save_position(data: dict):
     db = SessionLocal()
     try:
+        register_or_update_vehicle_client(db, data["device_id"], data.get("topic"))
         ensure_vehicle_day_table(data["device_id"])
         db.add(
             VehiclePosition(
@@ -232,6 +266,17 @@ def save_position(data: dict):
         db.commit()
     finally:
         db.close()
+
+
+def register_or_update_vehicle_client(db, device_id: str, topic: Optional[str] = None):
+    now = datetime.now(timezone.utc)
+    client = db.query(VehicleClient).filter(VehicleClient.device_id == device_id).first()
+    if client is None:
+        db.add(VehicleClient(device_id=device_id, first_seen_at=now, last_seen_at=now, last_topic=topic))
+    else:
+        client.last_seen_at = now
+        if topic:
+            client.last_topic = topic
 
 
 def sanitize_table_fragment(value: str) -> str:
@@ -441,7 +486,7 @@ def devices(current_user=Depends(get_current_user)):
     del current_user
     db = SessionLocal()
     try:
-        rows = db.query(VehiclePosition.device_id).distinct().all()
+        rows = db.query(VehicleClient.device_id).order_by(VehicleClient.device_id.asc()).all()
         return {"devices": sorted([r[0] for r in rows])}
     finally:
         db.close()

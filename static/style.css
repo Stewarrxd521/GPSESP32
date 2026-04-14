@@ -7,11 +7,13 @@ body { margin:0; font-family: Inter, system-ui, Arial, sans-serif; background: l
 h1, h2 { margin:0 0 14px; }
 .muted { color:var(--muted); }
 form, .controls { display:grid; gap:10px; margin-top:18px; }
+.engine-actions { display:grid; grid-template-columns: 1fr 1fr; gap:10px; }
 label { font-size:.92rem; color:var(--muted); }
 input, button, select { border-radius:14px; padding:12px 14px; border:1px solid var(--line); font: inherit; }
 input, select { background:#0c1329; color:var(--text); }
 button { background: var(--accent); border:none; color:#09111f; font-weight:700; cursor:pointer; }
 button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+button.danger { background: #ff6b6b; color: #2a0b0b; }
 .msg { margin-top:14px; min-height: 1.2em; color:#ffd27d; }
 
 .topbar { display:flex; justify-content:space-between; align-items:center; padding:16px 20px; border-bottom:1px solid var(--line); position:sticky; top:0; background:rgba(11,16,32,.92); backdrop-filter: blur(8px); z-index:10; }

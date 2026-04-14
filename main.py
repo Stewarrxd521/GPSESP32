@@ -18,7 +18,8 @@ from fastapi.security import OAuth2PasswordBearer
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from jose import JWTError, jwt
-from sqlalchemy import Column, DateTime, Float, Integer, String, Text, create_engine, desc
+from pydantic import BaseModel
+from sqlalchemy import Column, DateTime, Float, Integer, String, Text, create_engine, desc, text
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 logging.basicConfig(level=logging.INFO)
@@ -38,6 +39,7 @@ MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
 MQTT_USER = os.getenv("MQTT_USER", "")
 MQTT_PASSWORD = os.getenv("MQTT_PASSWORD", "")
 MQTT_TOPIC = os.getenv("MQTT_TOPIC", "vehicles/+/gps")
+MQTT_COMMAND_TOPIC = os.getenv("MQTT_COMMAND_TOPIC", "vehicles/{device_id}/command")
 MQTT_TLS = os.getenv("MQTT_TLS", "true").lower() in {"1", "true", "yes"}
 MQTT_TLS_INSECURE = os.getenv("MQTT_TLS_INSECURE", "false").lower() in {"1", "true", "yes"}
 
@@ -179,6 +181,7 @@ class ConnectionManager:
 
 
 manager = ConnectionManager()
+mqtt_client_instance: Optional[mqtt.Client] = None
 
 
 def parse_vehicle_payload(topic: str, payload: bytes) -> dict:
@@ -211,6 +214,7 @@ def parse_vehicle_payload(topic: str, payload: bytes) -> dict:
 def save_position(data: dict):
     db = SessionLocal()
     try:
+        ensure_vehicle_day_table(data["device_id"])
         db.add(
             VehiclePosition(
                 device_id=data["device_id"],
@@ -224,8 +228,75 @@ def save_position(data: dict):
             )
         )
         db.commit()
+        save_position_in_vehicle_day_table(db, data)
+        db.commit()
     finally:
         db.close()
+
+
+def sanitize_table_fragment(value: str) -> str:
+    safe = "".join(ch.lower() if ch.isalnum() else "_" for ch in value.strip())
+    safe = safe.strip("_")
+    return safe or "unknown"
+
+
+def get_vehicle_day_table_name(device_id: str, day: date) -> str:
+    device = sanitize_table_fragment(device_id)
+    return f"vehicle_{device}_{day.strftime('%Y%m%d')}"
+
+
+def ensure_vehicle_day_table(device_id: str, day: Optional[date] = None):
+    table_day = day or datetime.now(timezone.utc).date()
+    table_name = get_vehicle_day_table_name(device_id, table_day)
+    if engine.dialect.name == "sqlite":
+        id_column = "INTEGER PRIMARY KEY AUTOINCREMENT"
+        created_at_column = "DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+    else:
+        id_column = "BIGSERIAL PRIMARY KEY"
+        created_at_column = "TIMESTAMPTZ NOT NULL DEFAULT NOW()"
+
+    sql = f"""
+    CREATE TABLE IF NOT EXISTS "{table_name}" (
+        id {id_column},
+        device_id VARCHAR(120) NOT NULL,
+        lat DOUBLE PRECISION NOT NULL,
+        lng DOUBLE PRECISION NOT NULL,
+        speed DOUBLE PRECISION NULL,
+        heading DOUBLE PRECISION NULL,
+        altitude DOUBLE PRECISION NULL,
+        accuracy DOUBLE PRECISION NULL,
+        raw TEXT NULL,
+        created_at {created_at_column}
+    )
+    """
+    with engine.begin() as conn:
+        conn.execute(text(sql))
+
+
+def save_position_in_vehicle_day_table(db, data: dict):
+    day = datetime.now(timezone.utc).date()
+    table_name = get_vehicle_day_table_name(data["device_id"], day)
+    sql = text(
+        f"""
+        INSERT INTO "{table_name}"
+        (device_id, lat, lng, speed, heading, altitude, accuracy, raw, created_at)
+        VALUES (:device_id, :lat, :lng, :speed, :heading, :altitude, :accuracy, :raw, :created_at)
+        """
+    )
+    db.execute(
+        sql,
+        {
+            "device_id": data["device_id"],
+            "lat": data["lat"],
+            "lng": data["lng"],
+            "speed": data.get("speed"),
+            "heading": data.get("heading"),
+            "altitude": data.get("altitude"),
+            "accuracy": data.get("accuracy"),
+            "raw": data.get("raw"),
+            "created_at": datetime.now(timezone.utc),
+        },
+    )
 
 
 def on_mqtt_connect(client, userdata, flags, rc, properties=None):
@@ -275,17 +346,46 @@ def start_mqtt(loop: asyncio.AbstractEventLoop):
     return client
 
 
+class VehicleCommand(BaseModel):
+    device_id: str
+    action: str
+
+
+def publish_vehicle_command(device_id: str, action: str):
+    if mqtt_client_instance is None:
+        raise HTTPException(status_code=503, detail="Cliente MQTT no disponible")
+
+    action_key = action.strip().lower()
+    if action_key not in {"on", "off"}:
+        raise HTTPException(status_code=400, detail="Acción inválida. Use 'on' o 'off'")
+
+    topic = MQTT_COMMAND_TOPIC.format(device_id=device_id)
+    payload = json.dumps(
+        {
+            "device_id": device_id,
+            "action": "engine_on" if action_key == "on" else "engine_off",
+            "requested_at": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+    result = mqtt_client_instance.publish(topic, payload=payload, qos=1)
+    if result.rc != mqtt.MQTT_ERR_SUCCESS:
+        raise HTTPException(status_code=502, detail="No se pudo publicar comando MQTT")
+    return {"ok": True, "topic": topic, "payload": json.loads(payload)}
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app_instance: FastAPI):
     del app_instance
+    global mqtt_client_instance
     ensure_admin_user()
-    mqtt_client = start_mqtt(asyncio.get_running_loop())
+    mqtt_client_instance = start_mqtt(asyncio.get_running_loop())
     try:
         yield
     finally:
-        if mqtt_client is not None:
-            mqtt_client.loop_stop()
-            mqtt_client.disconnect()
+        if mqtt_client_instance is not None:
+            mqtt_client_instance.loop_stop()
+            mqtt_client_instance.disconnect()
+            mqtt_client_instance = None
 
 
 app.router.lifespan_context = lifespan
@@ -388,6 +488,12 @@ def history_by_day(
         return {"device_id": device_id, "day": day.isoformat(), "points": [_row_to_point(r) for r in rows]}
     finally:
         db.close()
+
+
+@app.post("/api/vehicle/command")
+def vehicle_command(command: VehicleCommand, current_user=Depends(get_current_user)):
+    del current_user
+    return publish_vehicle_command(command.device_id, command.action)
 
 
 def _row_to_point(row: VehiclePosition) -> dict:

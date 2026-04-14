@@ -5,10 +5,13 @@ import hmac
 import json
 import logging
 import os
+import socket
 import ssl
 import secrets
+import time as pytime
 from base64 import b64decode, b64encode
 from datetime import date, datetime, time, timedelta, timezone
+from urllib.parse import parse_qsl, quote_plus, urlencode, urlparse, urlunparse
 from typing import Optional, Set
 
 import paho.mqtt.client as mqtt
@@ -32,7 +35,54 @@ ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 ADMIN_USER = os.getenv("ADMIN_USER", "admin")
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./gps.db")
+def build_database_url() -> str:
+    explicit_url = os.getenv("DATABASE_URL")
+    if explicit_url:
+        return explicit_url
+
+    db_host = os.getenv("DB_HOST", "").strip()
+    if not db_host:
+        return "sqlite:///./gps.db"
+
+    db_port = os.getenv("DB_PORT", "5432").strip()
+    db_name = os.getenv("DB_NAME", "postgres").strip()
+    db_user = os.getenv("DB_USER", "postgres").strip()
+    db_password = os.getenv("DB_PASSWORD", "").strip()
+    db_sslmode = os.getenv("DB_SSLMODE", "require").strip()
+
+    password_part = f":{quote_plus(db_password)}" if db_password else ""
+    return f"postgresql+psycopg://{db_user}{password_part}@{db_host}:{db_port}/{db_name}?sslmode={db_sslmode}"
+
+
+def add_ipv4_hostaddr(database_url: str) -> str:
+    parsed = urlparse(database_url)
+    hostname = parsed.hostname
+    if not hostname:
+        return database_url
+
+    query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    if "hostaddr" in query_params:
+        return database_url
+
+    try:
+        ipv4_info = socket.getaddrinfo(hostname, parsed.port or 5432, socket.AF_INET, socket.SOCK_STREAM)
+        if not ipv4_info:
+            return database_url
+        ipv4 = ipv4_info[0][4][0]
+    except socket.gaierror:
+        return database_url
+
+    query_params["hostaddr"] = ipv4
+    new_query = urlencode(query_params)
+    return urlunparse(parsed._replace(query=new_query))
+
+
+DATABASE_URL = build_database_url()
+DB_FORCE_IPV4 = os.getenv("DB_FORCE_IPV4", "true").lower() in {"1", "true", "yes"}
+if DB_FORCE_IPV4 and DATABASE_URL.startswith("postgresql"):
+    DATABASE_URL = add_ipv4_hostaddr(DATABASE_URL)
+if DATABASE_URL.startswith("sqlite"):
+    logger.warning("DATABASE_URL no configurada para PostgreSQL; usando SQLite local (no recomendado para producción)")
 
 MQTT_HOST = os.getenv("MQTT_HOST", "")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "8883"))
@@ -74,7 +124,15 @@ class VehiclePosition(Base):
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
 
 
-Base.metadata.create_all(bind=engine)
+class VehicleClient(Base):
+    __tablename__ = "vehicle_clients"
+
+    id = Column(Integer, primary_key=True, index=True)
+    device_id = Column(String(120), unique=True, index=True, nullable=False)
+    first_seen_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    last_seen_at = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False)
+    last_topic = Column(String(255), nullable=True)
+
 
 app = FastAPI(title="GPS Tracker MQTT", version="2.0.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -184,6 +242,23 @@ manager = ConnectionManager()
 mqtt_client_instance: Optional[mqtt.Client] = None
 
 
+def init_database_schema(retries: int = 5, delay_seconds: float = 2.0) -> bool:
+    for attempt in range(1, retries + 1):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return True
+        except Exception as exc:
+            logger.error(
+                "No se pudo inicializar la base de datos (intento %s/%s): %s",
+                attempt,
+                retries,
+                exc,
+            )
+            if attempt < retries:
+                pytime.sleep(delay_seconds)
+    return False
+
+
 def parse_vehicle_payload(topic: str, payload: bytes) -> dict:
     raw = payload.decode("utf-8", errors="ignore")
     data = json.loads(raw)
@@ -200,6 +275,7 @@ def parse_vehicle_payload(topic: str, payload: bytes) -> dict:
 
     return {
         "device_id": str(device_id),
+        "topic": topic,
         "lat": lat,
         "lng": lng,
         "speed": speed,
@@ -214,6 +290,7 @@ def parse_vehicle_payload(topic: str, payload: bytes) -> dict:
 def save_position(data: dict):
     db = SessionLocal()
     try:
+        register_or_update_vehicle_client(db, data["device_id"], data.get("topic"))
         ensure_vehicle_day_table(data["device_id"])
         db.add(
             VehiclePosition(
@@ -232,6 +309,17 @@ def save_position(data: dict):
         db.commit()
     finally:
         db.close()
+
+
+def register_or_update_vehicle_client(db, device_id: str, topic: Optional[str] = None):
+    now = datetime.now(timezone.utc)
+    client = db.query(VehicleClient).filter(VehicleClient.device_id == device_id).first()
+    if client is None:
+        db.add(VehicleClient(device_id=device_id, first_seen_at=now, last_seen_at=now, last_topic=topic))
+    else:
+        client.last_seen_at = now
+        if topic:
+            client.last_topic = topic
 
 
 def sanitize_table_fragment(value: str) -> str:
@@ -377,7 +465,14 @@ def publish_vehicle_command(device_id: str, action: str):
 async def lifespan(app_instance: FastAPI):
     del app_instance
     global mqtt_client_instance
-    ensure_admin_user()
+    db_ready = init_database_schema(
+        retries=int(os.getenv("DB_INIT_RETRIES", "8")),
+        delay_seconds=float(os.getenv("DB_INIT_RETRY_SECONDS", "2")),
+    )
+    if db_ready:
+        ensure_admin_user()
+    else:
+        logger.error("La app inicia sin DB disponible; endpoints con DB pueden fallar hasta que se recupere conexión.")
     mqtt_client_instance = start_mqtt(asyncio.get_running_loop())
     try:
         yield
@@ -441,7 +536,7 @@ def devices(current_user=Depends(get_current_user)):
     del current_user
     db = SessionLocal()
     try:
-        rows = db.query(VehiclePosition.device_id).distinct().all()
+        rows = db.query(VehicleClient.device_id).order_by(VehicleClient.device_id.asc()).all()
         return {"devices": sorted([r[0] for r in rows])}
     finally:
         db.close()

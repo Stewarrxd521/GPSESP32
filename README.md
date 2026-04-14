@@ -34,7 +34,8 @@ Payload JSON:
 
 - `SECRET_KEY`: JWT secreto (Render ya lo genera).
 - `ADMIN_USER`, `ADMIN_PASSWORD`: acceso web.
-- `DATABASE_URL`: conexión a PostgreSQL.
+- `DATABASE_URL`: conexión a PostgreSQL (recomendado para producción).
+- Alternativa sin URL completa: `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD`, `DB_SSLMODE=require` (ideal para Supabase).
 - `MQTT_HOST=5022a5cb4cc744049a477ca9676481fd.s1.eu.hivemq.cloud`
 - `MQTT_PORT=8883`
 - `MQTT_USER`, `MQTT_PASSWORD`: credenciales HiveMQ Cloud.
@@ -55,6 +56,25 @@ Payload JSON:
 2. En Render, crear servicio web desde repo (Render detecta `render.yaml`).
 3. Configurar secretos (`ADMIN_PASSWORD`, `MQTT_USER`, `MQTT_PASSWORD`).
 4. Abrir URL del servicio y autenticar.
+
+### Ejemplo Supabase
+
+Si vas a usar Supabase Postgres, puedes configurar:
+
+```txt
+DB_HOST=db.whpkoqubhccfezrwwpvl.supabase.co
+DB_PORT=5432
+DB_NAME=postgres
+DB_USER=postgres
+DB_PASSWORD=<tu-password>
+DB_SSLMODE=require
+```
+
+O la URL completa:
+
+```txt
+DATABASE_URL=postgresql+psycopg://postgres:<tu-password>@db.whpkoqubhccfezrwwpvl.supabase.co:5432/postgres?sslmode=require
+```
 
 ## Seguridad recomendada
 
